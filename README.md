@@ -5,8 +5,8 @@ BundleHelper 是一个 Windows 桌面工具，用于通过 Git bundle 在本地�
 ## 环境
 
 - Windows 10/11 x64
-- Git for Windows 2.30+
-- Windows OpenSSH Client
+- Git for Windows 2.30+（优先使用其自带 OpenSSH 工具集）
+- Windows OpenSSH Client（仅在 Git 工具集不可用时回退）
 - 服务器安装 Git 和 `sha256sum`
 
 ## 开发运行
@@ -47,3 +47,15 @@ uv run pyinstaller --noconfirm --clean scripts/bundlehelper.spec
 ```
 
 产物位于 `dist/BundleHelper/`。
+
+## SSH 兼容性
+
+工具会优先使用 Git for Windows 安装目录中的 `ssh`、`scp`、`ssh-keyscan` 和 `ssh-keygen`，避免旧版 Windows 系统 OpenSSH 不支持较新密钥交换算法而出现 `unsupported KEX method`。
+
+如果 Git 安装在非标准位置，可设置 `BUNDLEHELPER_SSH_DIR` 指向一个同时包含上述四个程序的目录，例如：
+
+```powershell
+$env:BUNDLEHELPER_SSH_DIR = 'C:\Program Files\Git\usr\bin'
+```
+
+修改环境变量后重新启动 BundleHelper。

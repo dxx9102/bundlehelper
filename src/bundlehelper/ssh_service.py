@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import shutil
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from .errors import CommandError, PreflightError, ValidationError
 from .git_service import GitService
 from .logging_service import OperationLogger
 from .models import RefManifest, SshConfig
-from .process_runner import CommandResult, CommandRunner, posix_quote, require_executable
+from .process_runner import CommandResult, CommandRunner, posix_quote
 
 
 @dataclass(slots=True)
@@ -23,15 +24,107 @@ class HostKeyOption:
     key_type: str
 
 
+@dataclass(frozen=True, slots=True)
+class OpenSshTools:
+    directory: Path
+    ssh: str
+    scp: str
+    keyscan: str
+    keygen: str
+
+
+_OPENSSH_TOOL_NAMES = ("ssh", "scp", "ssh-keyscan", "ssh-keygen")
+
+
+def _executable_in(directory: Path, name: str) -> str | None:
+    filenames = (f"{name}.exe", name) if os.name == "nt" else (name, f"{name}.exe")
+    for filename in filenames:
+        candidate = directory / filename
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _tools_in_directory(directory: Path) -> OpenSshTools | None:
+    resolved = directory.expanduser().resolve()
+    tools = {name: _executable_in(resolved, name) for name in _OPENSSH_TOOL_NAMES}
+    if not all(tools.values()):
+        return None
+    return OpenSshTools(
+        directory=resolved,
+        ssh=tools["ssh"],
+        scp=tools["scp"],
+        keyscan=tools["ssh-keyscan"],
+        keygen=tools["ssh-keygen"],
+    )
+
+
+def _unique_directories(directories: Sequence[Path]) -> list[Path]:
+    result: list[Path] = []
+    seen: set[str] = set()
+    for directory in directories:
+        key = os.path.normcase(str(directory.expanduser().resolve()))
+        if key not in seen:
+            seen.add(key)
+            result.append(directory)
+    return result
+
+
+def resolve_openssh_tools() -> OpenSshTools:
+    """Resolve one consistent OpenSSH tool set, preferring Git for Windows.
+
+    Windows System OpenSSH may be older than the OpenSSH shipped with Git for
+    Windows and can therefore lack post-quantum KEX algorithms required by a
+    server. Keeping all four binaries from the same installation avoids mixed
+    known_hosts/key parsing behavior.
+    """
+
+    candidates: list[Path] = []
+    override = os.environ.get("BUNDLEHELPER_SSH_DIR", "").strip()
+    if override:
+        candidates.append(Path(override))
+    git_executable = shutil.which("git")
+    if git_executable:
+        git_path = Path(git_executable).resolve()
+        for parent in git_path.parents:
+            candidates.append(parent / "usr" / "bin")
+    for directory in _unique_directories(candidates):
+        tools = _tools_in_directory(directory)
+        if tools:
+            return tools
+
+    resolved = {name: shutil.which(name) for name in _OPENSSH_TOOL_NAMES}
+    missing = [name for name, value in resolved.items() if not value]
+    if not missing:
+        return OpenSshTools(
+            directory=Path(resolved["ssh"]).resolve().parent,
+            ssh=str(resolved["ssh"]),
+            scp=str(resolved["scp"]),
+            keyscan=str(resolved["ssh-keyscan"]),
+            keygen=str(resolved["ssh-keygen"]),
+        )
+    raise CommandError(
+        "未找到完整的 OpenSSH 工具集（ssh、scp、ssh-keyscan、ssh-keygen）："
+        + ", ".join(missing)
+        + "。请安装 Git for Windows，或通过 BUNDLEHELPER_SSH_DIR 指定包含这些程序的目录"
+    )
+
+
 class SshService:
     def __init__(self, config: SshConfig, known_hosts_path: str | Path, runner: CommandRunner | None = None):
         self.config = config
         self.known_hosts_path = Path(known_hosts_path).expanduser()
         self.runner = runner or CommandRunner()
+        self._tools: OpenSshTools | None = None
 
-    def check_available(self) -> None:
-        for executable in ("ssh", "scp", "ssh-keyscan", "ssh-keygen"):
-            require_executable(executable)
+    @property
+    def tools(self) -> OpenSshTools:
+        if self._tools is None:
+            self._tools = resolve_openssh_tools()
+        return self._tools
+
+    def check_available(self) -> OpenSshTools:
+        return self.tools
 
     @property
     def target(self) -> str:
@@ -57,10 +150,10 @@ class SshService:
         return options
 
     def _ssh_argv(self) -> list[str]:
-        return [require_executable("ssh"), "-p", str(self.config.port), *self._common_options(), self.target]
+        return [self.tools.ssh, "-p", str(self.config.port), *self._common_options(), self.target]
 
     def _scp_argv(self) -> list[str]:
-        return [require_executable("scp"), "-P", str(self.config.port), *self._common_options()]
+        return [self.tools.scp, "-P", str(self.config.port), *self._common_options()]
 
     def is_host_known(self) -> bool:
         if not self.known_hosts_path.is_file():
@@ -76,13 +169,22 @@ class SshService:
         return False
 
     def scan_host_keys(self) -> list[HostKeyOption]:
-        keyscan = require_executable("ssh-keyscan")
+        tools = self.tools
         result = self.runner.run(
-            [keyscan, "-T", "10", "-p", str(self.config.port), self.config.host],
+            [tools.keyscan, "-T", "10", "-p", str(self.config.port), self.config.host],
             check=False,
         )
         if not result.ok or not result.output.strip():
-            raise PreflightError(f"无法读取服务器主机密钥：{result.output.strip() or '没有返回密钥'}")
+            detail = result.output.strip() or "没有返回密钥"
+            hint = ""
+            if "unsupported kex method" in detail.lower():
+                hint = (
+                    "\n当前 OpenSSH 客户端与服务器没有共同的密钥交换算法。"
+                    "请升级 Git for Windows，或通过 BUNDLEHELPER_SSH_DIR 指定兼容的 OpenSSH 目录。"
+                )
+            raise PreflightError(
+                f"无法读取服务器主机密钥（客户端：{tools.keyscan}）：{detail}{hint}"
+            )
         key_lines = [
             line.strip()
             for line in result.output.splitlines()
@@ -99,7 +201,7 @@ class SshService:
                 temp.write(normalized + "\n")
                 temp_path = temp.name
             try:
-                fingerprint_result = self.runner.run([require_executable("ssh-keygen"), "-lf", temp_path], check=False)
+                fingerprint_result = self.runner.run([tools.keygen, "-lf", temp_path], check=False)
                 if fingerprint_result.ok and fingerprint_result.output.strip():
                     fingerprint = fingerprint_result.output.strip().split()[1]
                     options.append(HostKeyOption(raw=normalized, fingerprint=fingerprint, key_type=key_type))
