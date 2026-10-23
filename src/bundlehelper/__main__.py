@@ -1,4 +1,4 @@
-from .ui import main
+from bundlehelper.ui import main
 
 
 if __name__ == "__main__":
