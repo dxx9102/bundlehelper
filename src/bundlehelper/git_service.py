@@ -290,6 +290,14 @@ class GitService:
     def incoming_refs(self, repo: str | Path) -> tuple[dict[str, str], dict[str, str]]:
         return self._refs(repo, "refs/bundlehelper/incoming/"), self._refs(repo, "refs/bundlehelper/incoming-tags/")
 
+    def is_bare(self, repo: str | Path) -> bool:
+        result = self._run(["rev-parse", "--is-bare-repository"], repo=repo, check=False)
+        return result.ok and result.output.strip().lower() == "true"
+
+    def commit_exists(self, repo: str | Path, oid: str) -> bool:
+        result = self._run(["cat-file", "-e", f"{oid}^{{commit}}"], repo=repo, check=False)
+        return result.ok
+
     def is_ancestor(self, repo: str | Path, ancestor: str, descendant: str) -> bool:
         result = self._run(["merge-base", "--is-ancestor", ancestor, descendant], repo=repo, check=False)
         if result.returncode not in (0, 1):

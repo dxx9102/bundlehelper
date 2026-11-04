@@ -24,7 +24,7 @@ from .logging_service import OperationLogger, prune_logs, sanitize_text
 from .models import AppSettings, AppState, ProjectConfig, RefManifest, default_bundle_dir, default_log_dir
 from .process_runner import safe_remove_dir
 from .ssh_service import HostKeyOption, SshService
-from .sync_service import SyncService
+from .sync_service import AdoptionReport, SyncService
 
 APP_STYLE = """
 QMainWindow, QDialog { background: #f4f6f8; }
@@ -306,6 +306,8 @@ class MainWindow(QMainWindow):
         self.full_button = QPushButton("首次全量部署")
         self.full_button.setProperty("primary", True)
         self.full_button.clicked.connect(self._start_full_bootstrap)
+        self.adopt_button = QPushButton("接入已有仓库")
+        self.adopt_button.clicked.connect(self._start_adopt_existing)
         self.delta_button = QPushButton("拉取服务器增量")
         self.delta_button.setProperty("primary", True)
         self.delta_button.clicked.connect(self._start_delta_sync)
@@ -317,6 +319,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self._cancel_active)
         actions.addWidget(self.check_ssh_button)
         actions.addWidget(self.full_button)
+        actions.addWidget(self.adopt_button)
         actions.addWidget(self.delta_button)
         actions.addWidget(self.push_button)
         actions.addStretch(1)
@@ -325,7 +328,8 @@ class MainWindow(QMainWindow):
         self._lockable_widgets = [
             self.project_panel, self.form_panel, self.settings_button, self.save_button,
             self.temp_button, self.clean_temp_button, self.open_logs_button,
-            self.check_ssh_button, self.full_button, self.delta_button, self.push_button,
+            self.check_ssh_button, self.full_button, self.adopt_button, self.delta_button,
+            self.push_button,
         ]
 
     def _build_project_form(self) -> None:
@@ -606,14 +610,20 @@ class MainWindow(QMainWindow):
             stamp = project.baseline.captured_at.replace("T", " ")[:19]
             self.setup_label.setText(f"同步基线：{stamp} UTC · {len(project.baseline.heads)} 个分支 · {len(project.baseline.tags)} 个 Tag")
         else:
-            self.setup_label.setText("同步基线：尚未完成首次全量部署")
+            self.setup_label.setText("同步基线：尚未建立（可首次全量部署或接入已有仓库）")
 
     def _refresh_action_state(self) -> None:
         active = self._active_worker is not None
         for widget in self._lockable_widgets:
             widget.setEnabled(not active)
         if active:
-            for button in (self.check_ssh_button, self.full_button, self.delta_button, self.push_button):
+            for button in (
+                self.check_ssh_button,
+                self.full_button,
+                self.adopt_button,
+                self.delta_button,
+                self.push_button,
+            ):
                 button.setEnabled(False)
             return
 
@@ -625,6 +635,7 @@ class MainWindow(QMainWindow):
         )
         self.check_ssh_button.setEnabled(ssh_ready)
         self.full_button.setEnabled(repo_ready and ssh_ready)
+        self.adopt_button.setEnabled(repo_ready and ssh_ready and project.baseline is None)
         self.delta_button.setEnabled(repo_ready and ssh_ready and project.setup_complete and project.baseline is not None)
         self.push_button.setEnabled(bool(project.github_url.strip() and project.local_repo_path.strip()))
         self.temp_button.setEnabled(bool(project.resolved_bundle_dir(self.state.settings).strip()))
@@ -1002,6 +1013,112 @@ class MainWindow(QMainWindow):
             cancel_until=30,
         )
 
+    def _start_adopt_existing(self) -> None:
+        if self._active_worker is not None:
+            return
+        self._apply_form_to_current()
+        project = copy.deepcopy(self._current_project())
+        settings = copy.deepcopy(self.state.settings)
+        try:
+            settings.validate()
+            project.validate()
+        except Exception as exc:
+            QMessageBox.warning(self, "配置无效", str(exc))
+            return
+        if project.baseline is not None:
+            QMessageBox.information(
+                self,
+                "已有同步基线",
+                "当前项目已经建立同步基线，请使用“拉取服务器增量”。",
+            )
+            return
+        self._persist_state(show_error=False)
+
+        def inspect_runner(
+            logger: OperationLogger,
+            progress: Callable[[int, str], None],
+            _output: Callable[[str], None],
+            cancel_event: threading.Event,
+        ) -> object:
+            service = self._sync_factory(self.config_store.known_hosts_path)
+            return service.inspect_existing_repos(
+                project,
+                settings,
+                logger=logger,
+                progress=progress,
+                cancel_event=cancel_event,
+            )
+
+        def on_inspected(result: object) -> str:
+            if not isinstance(result, AdoptionReport):
+                raise BundleHelperError("已有仓库检查未返回有效结果。")
+            if not result.can_adopt:
+                details = "\n".join(f"• {issue}" for issue in result.issues)
+                self._append_log("已有仓库接入检查发现阻断问题，未执行接入。")
+                QMessageBox.warning(
+                    self,
+                    "无法接入已有仓库",
+                    "检查发现以下阻断问题，工具不会修改本地或服务器仓库：\n\n" + details,
+                )
+                return ""
+
+            transition = "本地与服务器引用一致，将仅建立同步基线。"
+            if result.has_ref_changes:
+                fast_forward = "、".join(sorted(result.fast_forward_heads)) or "无"
+                transition = (
+                    f"可快进分支：{fast_forward}\n"
+                    f"服务器新增分支：{len(result.new_heads)} 个\n"
+                    f"服务器新增 Tag：{len(result.new_tags)} 个"
+                )
+            answer = QMessageBox.question(
+                self,
+                "确认接入已有仓库",
+                "已有仓库检查通过。\n\n"
+                + transition
+                + "\n\n本次只允许服务器向本地更新，不会上传本地提交，不会自动 merge、"
+                "强推或删除引用。是否继续？",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return ""
+
+            def adopt_runner(
+                worker_logger: OperationLogger,
+                progress: Callable[[int, str], None],
+                _output: Callable[[str], None],
+                cancel_event: threading.Event,
+            ) -> object:
+                service = self._sync_factory(self.config_store.known_hosts_path)
+                return service.adopt_existing_repos(
+                    project,
+                    settings,
+                    expected=result,
+                    logger=worker_logger,
+                    progress=progress,
+                    cancel_event=cancel_event,
+                )
+
+            def on_adopted(baseline: object) -> str:
+                return self._record_manifest(project.id, baseline, "已有仓库接入完成")
+
+            self._begin_sync_operation(
+                "接入已有仓库",
+                project,
+                settings,
+                adopt_runner,
+                on_adopted,
+                cancel_until=30,
+            )
+            return ""
+
+        self._begin_sync_operation(
+            "检查已有仓库",
+            project,
+            settings,
+            inspect_runner,
+            on_inspected,
+            cancel_until=100,
+        )
+
     def _start_delta_sync(self) -> None:
         if self._active_worker is not None:
             return
@@ -1015,7 +1132,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "配置无效", str(exc))
             return
         if not project.setup_complete or project.baseline is None:
-            QMessageBox.information(self, "尚未部署", "请先完成首次全量部署。")
+            QMessageBox.information(self, "尚未部署", "请先完成首次全量部署或接入已有仓库。")
             return
         self._persist_state(show_error=False)
 

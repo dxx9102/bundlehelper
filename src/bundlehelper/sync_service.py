@@ -28,6 +28,24 @@ class DeltaPlan:
     def has_ref_changes(self) -> bool:
         return bool(self.changed_heads or self.new_heads or self.new_tags)
 
+@dataclass(slots=True)
+class AdoptionReport:
+    local_manifest: RefManifest
+    server_manifest: RefManifest
+    fast_forward_heads: dict[str, tuple[str, str]] = field(default_factory=dict)
+    new_heads: dict[str, str] = field(default_factory=dict)
+    new_tags: dict[str, str] = field(default_factory=dict)
+    issues: list[str] = field(default_factory=list)
+
+    @property
+    def can_adopt(self) -> bool:
+        return not self.issues
+
+    @property
+    def has_ref_changes(self) -> bool:
+        return bool(self.fast_forward_heads or self.new_heads or self.new_tags)
+
+
 class SyncService:
     def __init__(self, git: GitService | None = None, known_hosts_path: str | Path | None = None):
         self.git = git or GitService()
@@ -57,11 +75,19 @@ class SyncService:
             raise ValidationError("服务器仓库目录不能是根目录")
         return normalized
 
-    def _ssh(self, config: ProjectConfig, settings: AppSettings, logger: OperationLogger) -> tuple[SshService, RemoteGitService]:
+    def _ssh(
+        self,
+        config: ProjectConfig,
+        settings: AppSettings,
+        logger: OperationLogger,
+        *,
+        ensure_temp_dir: bool = True,
+    ) -> tuple[SshService, RemoteGitService]:
         ssh = SshService(config.ssh, self.known_hosts_path)
         ssh.check_available()
         ssh.check_server(logger=logger)
-        ssh.ensure_remote_directory(config.resolved_remote_temp_dir(settings), logger=logger)
+        if ensure_temp_dir:
+            ssh.ensure_remote_directory(config.resolved_remote_temp_dir(settings), logger=logger)
         return ssh, RemoteGitService(ssh)
 
     def _local_context(self, config: ProjectConfig, settings: AppSettings) -> tuple[Path, Path, Path]:
@@ -201,6 +227,231 @@ class SyncService:
             else:
                 logger.error(f"操作失败，保留本地临时目录：{local_op}")
                 logger.error(f"操作失败，保留服务器临时目录：{remote_op}")
+    @staticmethod
+    def _manifest_snapshot(manifest: RefManifest) -> tuple[object, ...]:
+        return (
+            manifest.head_oid,
+            manifest.head_branch,
+            tuple(sorted(manifest.heads.items())),
+            tuple(sorted(manifest.tags.items())),
+        )
+
+    def inspect_existing_repos(
+        self,
+        config: ProjectConfig,
+        settings: AppSettings,
+        *,
+        logger: OperationLogger,
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> AdoptionReport:
+        config.validate()
+        settings.validate()
+        self._check_cancel(cancel_event)
+        self._progress(progress, 3, "检查本地仓库")
+        self.git.check_available()
+        repo = self._local_repo(config.local_repo_path)
+        if repo.is_dir() and self.git.is_bare(repo):
+            raise PreflightError(f"本地仓库是 bare 仓库，接入只支持普通工作仓库：{repo}")
+        if not repo.is_dir() or not (repo / ".git").exists():
+            raise PreflightError(f"本地 Git 仓库不存在：{repo}")
+        self._assert_origin(config, repo)
+        self.git.assert_no_unsupported_features(repo)
+        self.git.assert_single_worktree(repo)
+        clean, detail = self.git.is_clean(repo)
+        if not clean:
+            raise PreflightError("本地工作区有未提交或未跟踪文件：\n" + detail[:4000])
+        local_manifest = self.git.manifest(repo)
+
+        self._check_cancel(cancel_event)
+        self._progress(progress, 28, "检查服务器仓库")
+        server_repo = self._validate_server_repo_path(config.server_repo_path)
+        _ssh, remote_git = self._ssh(
+            config,
+            settings,
+            logger,
+            ensure_temp_dir=False,
+        )
+        if remote_git.is_bare(server_repo):
+            raise PreflightError(f"服务器仓库是 bare 仓库，接入只支持普通工作仓库：{server_repo}")
+        remote_git.validate_repository(server_repo)
+        remote_git.assert_no_unsupported_features(server_repo)
+        remote_git.assert_single_worktree(server_repo)
+        remote_git.assert_clean(server_repo)
+        server_manifest = remote_git.manifest(server_repo)
+
+        self._check_cancel(cancel_event)
+        self._progress(progress, 62, "对比本地与服务器引用")
+        report = AdoptionReport(
+            local_manifest=local_manifest,
+            server_manifest=server_manifest,
+        )
+        local_only_heads = sorted(set(local_manifest.heads) - set(server_manifest.heads))
+        if local_only_heads:
+            report.issues.append(
+                "服务器缺少本地分支，当前接入只支持服务器引用领先："
+                + ", ".join(local_only_heads)
+            )
+        local_only_tags = sorted(set(local_manifest.tags) - set(server_manifest.tags))
+        if local_only_tags:
+            report.issues.append(
+                "服务器缺少本地 Tag，当前接入只支持服务器引用领先："
+                + ", ".join(local_only_tags)
+            )
+
+        for name, server_oid in sorted(server_manifest.heads.items()):
+            local_oid = local_manifest.heads.get(name)
+            if local_oid is None:
+                report.new_heads[name] = server_oid
+                continue
+            if local_oid == server_oid:
+                continue
+            self._check_cancel(cancel_event)
+            if remote_git.commit_exists(server_repo, local_oid) and remote_git.is_ancestor(
+                server_repo, local_oid, server_oid
+            ):
+                report.fast_forward_heads[name] = (local_oid, server_oid)
+                continue
+            if self.git.commit_exists(repo, server_oid) and self.git.is_ancestor(
+                repo, server_oid, local_oid
+            ):
+                report.issues.append(f"本地分支 {name} 领先服务器，拒绝单向下行接入")
+            else:
+                report.issues.append(f"分支 {name} 在本地和服务器已分叉，请先手工合并")
+
+        for name, server_oid in sorted(server_manifest.tags.items()):
+            local_oid = local_manifest.tags.get(name)
+            if local_oid is None:
+                report.new_tags[name] = server_oid
+            elif local_oid != server_oid:
+                report.issues.append(f"Tag {name} 在本地和服务器指向不同对象")
+
+        self._progress(progress, 100, "已有仓库检查完成")
+        return report
+
+    def adopt_existing_repos(
+        self,
+        config: ProjectConfig,
+        settings: AppSettings,
+        *,
+        expected: AdoptionReport,
+        logger: OperationLogger,
+        progress: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> RefManifest:
+        self._progress(progress, 2, "重新检查已有仓库")
+        report = self.inspect_existing_repos(
+            config,
+            settings,
+            logger=logger,
+            progress=lambda value, message: self._progress(progress, min(value, 30), message),
+            cancel_event=cancel_event,
+        )
+        if (
+            self._manifest_snapshot(report.local_manifest)
+            != self._manifest_snapshot(expected.local_manifest)
+            or self._manifest_snapshot(report.server_manifest)
+            != self._manifest_snapshot(expected.server_manifest)
+        ):
+            raise PreflightError("本地或服务器引用在检查后发生变化，请重新检查再接入")
+        if not report.can_adopt:
+            raise PreflightError("已有仓库接入检查未通过：\n" + "\n".join(report.issues))
+        if not report.has_ref_changes:
+            logger.info("本地与服务器引用一致，仅建立同步基线")
+            self._progress(progress, 100, "引用一致，可以建立同步基线")
+            return report.server_manifest
+
+        self._check_cancel(cancel_event)
+        repo, _base, project_root = self._local_context(config, settings)
+        server_repo = self._validate_server_repo_path(config.server_repo_path)
+        if self.git.is_bare(repo):
+            raise PreflightError(f"本地仓库是 bare 仓库，接入只支持普通工作仓库：{repo}")
+        self.git.assert_no_unsupported_features(repo)
+        self.git.assert_single_worktree(repo)
+        clean, detail = self.git.is_clean(repo)
+        if not clean:
+            raise PreflightError("本地工作区有未提交或未跟踪文件：\n" + detail[:4000])
+        ssh, remote_git = self._ssh(config, settings, logger)
+        if remote_git.is_bare(server_repo):
+            raise PreflightError(f"服务器仓库是 bare 仓库，接入只支持普通工作仓库：{server_repo}")
+        remote_git.validate_repository(server_repo)
+        remote_git.assert_no_unsupported_features(server_repo)
+        remote_git.assert_single_worktree(server_repo)
+        remote_git.assert_clean(server_repo)
+
+        revisions: list[str] = []
+        for name, (old_oid, _new_oid) in sorted(report.fast_forward_heads.items()):
+            revisions.append(f"{old_oid}..refs/heads/{name}")
+        for name in sorted(report.new_heads):
+            revisions.append(f"refs/heads/{name}")
+        for name in sorted(report.new_tags):
+            revisions.append(f"refs/tags/{name}")
+        plan = DeltaPlan(
+            revisions=revisions,
+            changed_heads={
+                name: new_oid
+                for name, (_old_oid, new_oid) in report.fast_forward_heads.items()
+            },
+            new_heads=dict(report.new_heads),
+            new_tags=dict(report.new_tags),
+        )
+
+        operation_id = uuid.uuid4().hex[:12]
+        local_op = project_root / operation_id
+        local_op.mkdir(parents=True, exist_ok=False)
+        remote_base = config.resolved_remote_temp_dir(settings)
+        remote_op = ssh.make_remote_operation_dir(remote_base, config.id, operation_id)
+        remote_op_name = posixpath.basename(remote_op)
+        remote_bundle = posixpath.join(remote_op, "adoption.bundle")
+        local_bundle = local_op / "adoption.bundle"
+        success = False
+        try:
+            self._check_cancel(cancel_event)
+            self._progress(progress, 38, "生成服务器增量 bundle")
+            remote_git.create_incremental_bundle(server_repo, remote_bundle, plan.revisions, logger)
+            remote_hash = remote_git.sha256(remote_bundle)
+            self._progress(progress, 50, "下载增量 bundle")
+            ssh.download(remote_bundle, local_bundle, logger=logger, cancel_event=cancel_event)
+            local_hash = sha256_file(local_bundle)
+            if local_hash != remote_hash:
+                raise CommandError(f"增量 bundle 传输校验失败：服务器 {remote_hash}，本地 {local_hash}")
+            logger.info("增量 bundle SHA-256 校验通过")
+            self._check_cancel(cancel_event)
+            self._progress(progress, 66, "验证并应用服务器增量")
+            self.git.verify_bundle(repo, local_bundle, logger=logger)
+            self.git.fetch_bundle(repo, local_bundle, logger=logger)
+            incoming_heads, incoming_tags = self.git.incoming_refs(repo)
+            self._apply_delta(
+                repo,
+                report.local_manifest,
+                report.server_manifest,
+                plan,
+                incoming_heads,
+                incoming_tags,
+                logger,
+            )
+            self.git.cleanup_incoming_refs(repo)
+            success = True
+            self._progress(progress, 94, "清理临时文件")
+            return report.server_manifest
+        finally:
+            if success:
+                try:
+                    remote_git.remove_operation_dir(remote_base, remote_op, remote_op_name)
+                except Exception as exc:
+                    logger.error(f"清理服务器临时目录失败：{exc}")
+                try:
+                    safe_remove_dir(project_root, local_op, operation_id)
+                except Exception as exc:
+                    logger.error(f"清理本地临时目录失败：{exc}")
+            else:
+                try:
+                    self.git.cleanup_incoming_refs(repo)
+                except Exception:
+                    pass
+                logger.error(f"操作失败，保留本地临时目录：{local_op}")
+                logger.error(f"操作失败，保留服务器临时目录：{remote_op}")
+
     def _build_delta_plan(
         self,
         baseline: RefManifest,

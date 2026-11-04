@@ -73,6 +73,12 @@ class FakeRemoteGit:
     def manifest(self, repo: str):
         return self.git.manifest(self.ssh.local(repo))
 
+    def is_bare(self, repo: str) -> bool:
+        return self.git.is_bare(self.ssh.local(repo))
+
+    def commit_exists(self, repo: str, oid: str) -> bool:
+        return self.git.commit_exists(self.ssh.local(repo), oid)
+
     def is_ancestor(self, repo: str, ancestor: str, descendant: str) -> bool:
         return self.git.is_ancestor(self.ssh.local(repo), ancestor, descendant)
 

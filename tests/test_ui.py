@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QDialog, QMessageBox
 
 from bundlehelper.config import ConfigStore, InMemoryCredentialStore
 from bundlehelper.models import AppSettings, AppState, ProjectConfig, RefManifest
+from bundlehelper.sync_service import AdoptionReport
 from bundlehelper.ui import MainWindow, SettingsDialog
 
 
@@ -58,6 +59,7 @@ def test_project_switch_resolves_override_and_inherited_directories(qtbot, tmp_p
     assert str(tmp_path / "first bundles") in window.bundle_effective_label.text()
     assert not window.delta_button.isEnabled()
     assert window.full_button.isEnabled()
+    assert window.adopt_button.isEnabled()
 
     window.project_list.setCurrentRow(1)
     qtbot.wait(20)
@@ -66,6 +68,21 @@ def test_project_switch_resolves_override_and_inherited_directories(qtbot, tmp_p
     assert str(tmp_path / "global bundles") in window.bundle_effective_label.text()
     assert window.delta_button.isEnabled()
     assert window.push_button.isEnabled()
+    assert not window.adopt_button.isEnabled()
+    window.close()
+
+
+def test_adopt_button_requires_complete_configuration(qtbot, tmp_path: Path) -> None:
+    state = make_state(tmp_path)
+    state.projects[0].github_url = ""
+    window = MainWindow(
+        ConfigStore(tmp_path / "config" / "projects.json"),
+        InMemoryCredentialStore(),
+        state,
+    )
+    qtbot.addWidget(window)
+
+    assert not window.adopt_button.isEnabled()
     window.close()
 
 
@@ -142,3 +159,151 @@ def test_settings_dialog_returns_configured_values(qtbot, tmp_path: Path) -> Non
     assert dialog.retention_spin.value() == 12
     assert dialog.settings().log_dir == str(tmp_path / "logs")
     dialog.reject()
+
+def test_adopt_inspection_blocks_when_report_has_issues(qtbot, tmp_path: Path, monkeypatch) -> None:
+    state = make_state(tmp_path)
+    window = MainWindow(
+        ConfigStore(tmp_path / "config" / "projects.json"),
+        InMemoryCredentialStore(),
+        state,
+    )
+    qtbot.addWidget(window)
+    calls: list[dict[str, object]] = []
+    warnings: list[str] = []
+
+    def fake_begin(operation, project, settings, runner, on_success, **kwargs):
+        calls.append(
+            {
+                "operation": operation,
+                "project": project,
+                "settings": settings,
+                "runner": runner,
+                "on_success": on_success,
+                "kwargs": kwargs,
+            }
+        )
+
+    def fake_warning(_parent, _title, text):
+        warnings.append(text)
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(window, "_begin_sync_operation", fake_begin)
+    monkeypatch.setattr(QMessageBox, "warning", fake_warning)
+    window._start_adopt_existing()
+
+    assert [call["operation"] for call in calls] == ["检查已有仓库"]
+    local = RefManifest(head_oid="a" * 40, head_branch="main", heads={"main": "a" * 40})
+    server = RefManifest(head_oid="b" * 40, head_branch="main", heads={"main": "b" * 40})
+    report = AdoptionReport(
+        local_manifest=local,
+        server_manifest=server,
+        issues=["分支 main 在本地和服务器已分叉，请先手工合并"],
+    )
+
+    result = calls[0]["on_success"](report)  # type: ignore[operator]
+
+    assert result == ""
+    assert len(calls) == 1
+    assert "分支 main 在本地和服务器已分叉" in warnings[-1]
+    window.close()
+
+
+def test_adopt_confirmation_rechecks_and_records_server_baseline(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state = make_state(tmp_path)
+    window = MainWindow(
+        ConfigStore(tmp_path / "config" / "projects.json"),
+        InMemoryCredentialStore(),
+        state,
+    )
+    qtbot.addWidget(window)
+    local = RefManifest(head_oid="a" * 40, head_branch="main", heads={"main": "a" * 40})
+    server = RefManifest(
+        head_oid="c" * 40,
+        head_branch="main",
+        heads={"main": "c" * 40, "feature/server": "d" * 40},
+        tags={"v2.0.0": "e" * 40},
+    )
+    report = AdoptionReport(
+        local_manifest=local,
+        server_manifest=server,
+        fast_forward_heads={"main": ("a" * 40, "c" * 40)},
+        new_heads={"feature/server": "d" * 40},
+        new_tags={"v2.0.0": "e" * 40},
+    )
+
+    class FakeSync:
+        def __init__(self) -> None:
+            self.inspect_calls = 0
+            self.expected: AdoptionReport | None = None
+
+        def inspect_existing_repos(self, *_args, **_kwargs):
+            self.inspect_calls += 1
+            return report
+
+        def adopt_existing_repos(self, *_args, expected, **_kwargs):
+            self.expected = expected
+            return server
+
+    fake_sync = FakeSync()
+    calls: list[dict[str, object]] = []
+    questions: list[str] = []
+
+    def fake_begin(operation, project, settings, runner, on_success, **kwargs):
+        calls.append(
+            {
+                "operation": operation,
+                "project": project,
+                "settings": settings,
+                "runner": runner,
+                "on_success": on_success,
+                "kwargs": kwargs,
+            }
+        )
+
+    def fake_question(_parent, _title, text, *_args, **_kwargs):
+        questions.append(text)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(window, "_sync_factory", lambda _known_hosts: fake_sync)
+    monkeypatch.setattr(window, "_begin_sync_operation", fake_begin)
+    monkeypatch.setattr(QMessageBox, "question", fake_question)
+    window._start_adopt_existing()
+
+    assert [call["operation"] for call in calls] == ["检查已有仓库"]
+    inspected = calls[0]["runner"](  # type: ignore[operator]
+        object(),
+        lambda _value, _message: None,
+        lambda _line: None,
+        object(),
+    )
+    assert fake_sync.inspect_calls == 1
+    assert calls[0]["on_success"](inspected) == ""  # type: ignore[operator]
+
+    assert [call["operation"] for call in calls] == ["检查已有仓库", "接入已有仓库"]
+    question_text = questions[-1]
+    assert "可快进分支：main" in question_text
+    assert "服务器新增分支：1 个" in question_text
+    assert "服务器新增 Tag：1 个" in question_text
+
+    baseline = calls[1]["runner"](  # type: ignore[operator]
+        object(),
+        lambda _value, _message: None,
+        lambda _line: None,
+        object(),
+    )
+    assert fake_sync.expected is report
+    outcome = calls[1]["on_success"](baseline)  # type: ignore[operator]
+
+    current = window.state.projects[0]
+    assert current.setup_complete
+    assert current.baseline is not None
+    assert current.baseline.heads == server.heads
+    assert current.baseline.tags == server.tags
+    assert "已有仓库接入完成，同步基线已更新" in outcome
+    assert not window.adopt_button.isEnabled()
+    assert window.delta_button.isEnabled()
+    window.close()

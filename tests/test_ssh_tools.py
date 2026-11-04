@@ -9,7 +9,7 @@ from bundlehelper import ssh_service
 from bundlehelper.errors import PreflightError
 from bundlehelper.models import SshConfig
 from bundlehelper.process_runner import CommandResult
-from bundlehelper.ssh_service import SshService
+from bundlehelper.ssh_service import RemoteGitService, SshService
 
 
 def make_tool_directory(root: Path) -> Path:
@@ -61,6 +61,47 @@ class FakeRunner:
         if Path(args[0]).name.lower().startswith("ssh-keyscan"):
             return CommandResult(args, self.keyscan_code, self.keyscan_output)
         return CommandResult(args, 0, "256 SHA256:test-fingerprint comment (ED25519)")
+
+
+class FixedRemoteRunner:
+    def __init__(self, returncode: int, output: str) -> None:
+        self.returncode = returncode
+        self.output = output
+        self.calls: list[str] = []
+
+    def run(self, command, **_kwargs) -> CommandResult:
+        self.calls.append(command)
+        return CommandResult([command], self.returncode, self.output)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "output", "expected"),
+    [
+        (0, "true\n", True),
+        (0, "false\n", False),
+        (1, "fatal: not a repository\n", False),
+    ],
+)
+def test_remote_git_is_bare(returncode: int, output: str, expected: bool) -> None:
+    runner = FixedRemoteRunner(returncode, output)
+    service = RemoteGitService(runner)
+
+    assert service.is_bare("/srv/repo") is expected
+    assert "rev-parse" in runner.calls[0]
+    assert "--is-bare-repository" in runner.calls[0]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"),
+    [(0, True), (1, False)],
+)
+def test_remote_git_commit_exists(returncode: int, expected: bool) -> None:
+    runner = FixedRemoteRunner(returncode, "")
+    service = RemoteGitService(runner)
+
+    assert service.commit_exists("/srv/repo", "abc123") is expected
+    assert "cat-file -e" in runner.calls[0]
+    assert "abc123^{commit}" in runner.calls[0]
 
 
 def test_scan_host_keys_uses_resolved_tool_set(tmp_path: Path, monkeypatch) -> None:

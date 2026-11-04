@@ -401,6 +401,14 @@ class RemoteGitService:
             tags=self._refs(repo, "refs/tags/"),
         )
 
+    def is_bare(self, repo: str) -> bool:
+        result = self.run(repo, ["rev-parse", "--is-bare-repository"], check=False)
+        return result.ok and result.output.strip().lower() == "true"
+
+    def commit_exists(self, repo: str, oid: str) -> bool:
+        result = self.run(repo, ["cat-file", "-e", f"{oid}^{{commit}}"], check=False)
+        return result.ok
+
     def is_ancestor(self, repo: str, ancestor: str, descendant: str) -> bool:
         result = self.run(repo, ["merge-base", "--is-ancestor", ancestor, descendant], check=False)
         if result.returncode not in (0, 1):
