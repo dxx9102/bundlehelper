@@ -459,6 +459,20 @@ class MainWindow(QMainWindow):
         self._current_project_id = self.state.projects[0].id
         return self.state.projects[0]
 
+    def _find_project_item(self, project_id: str) -> QListWidgetItem | None:
+        for row in range(self.project_list.count()):
+            item = self.project_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == project_id:
+                return item
+        return None
+
+    def _next_project_name(self) -> str:
+        existing_names = {project.name.strip() for project in self.state.projects}
+        index = len(self.state.projects) + 1
+        while f"项目 {index}" in existing_names:
+            index += 1
+        return f"项目 {index}"
+
     def _apply_form_to_current(self) -> None:
         if self._loading_form:
             return
@@ -474,11 +488,9 @@ class MainWindow(QMainWindow):
         project.bundle_dir_override = self.bundle_override_edit.text().strip() or None
         project.remote_temp_dir_override = self.remote_override_edit.text().strip() or None
         project.log_dir_override = self.log_override_edit.text().strip() or None
-        current_row = self.project_list.currentRow()
-        if 0 <= current_row < self.project_list.count():
-            item = self.project_list.item(current_row)
+        item = self._find_project_item(project.id)
+        if item is not None:
             item.setText(project.name)
-            item.setData(0x0100, project.id)
 
     def _load_current_project(self) -> None:
         project = self._current_project()
@@ -513,7 +525,7 @@ class MainWindow(QMainWindow):
                 selected_row = 0
                 for index, project in enumerate(self.state.projects):
                     item = QListWidgetItem(project.name)
-                    item.setData(0x0100, project.id)
+                    item.setData(Qt.ItemDataRole.UserRole, project.id)
                     self.project_list.addItem(item)
                     if project.id == select_id:
                         selected_row = index
@@ -524,15 +536,17 @@ class MainWindow(QMainWindow):
     def _on_project_row_changed(self, row: int) -> None:
         if self._loading_form or row < 0 or row >= len(self.state.projects):
             return
-        self._apply_form_to_current()
+        item = self.project_list.item(row)
+        next_project_id = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(next_project_id, str) or not next_project_id:
+            next_project_id = self.state.projects[row].id
         self._persist_state(show_error=False)
-        self._current_project_id = self.state.projects[row].id
+        self._current_project_id = next_project_id
         self._load_current_project()
 
     def _add_project(self) -> None:
         self._apply_form_to_current()
-        index = len(self.state.projects) + 1
-        project = ProjectConfig(name=f"项目 {index}")
+        project = ProjectConfig(name=self._next_project_name())
         self.state.projects.append(project)
         self._persist_state(show_error=True)
         self._reload_project_list(project.id)
@@ -543,6 +557,7 @@ class MainWindow(QMainWindow):
         if len(self.state.projects) <= 1:
             QMessageBox.information(self, "无法删除", "至少需要保留一个项目。")
             return
+        self._apply_form_to_current()
         project = self._current_project()
         answer = QMessageBox.question(
             self, "删除项目",
@@ -554,12 +569,16 @@ class MainWindow(QMainWindow):
         self.state.projects.pop(index)
         next_index = min(index, len(self.state.projects) - 1)
         self._current_project_id = self.state.projects[next_index].id
-        self._persist_state(show_error=True)
+        if not self._persist_state(show_error=True, apply_form=False):
+            self.state.projects.insert(index, project)
+            self._current_project_id = project.id
+            return
         self._reload_project_list(self._current_project_id)
         self._load_current_project()
 
-    def _persist_state(self, *, show_error: bool = False) -> bool:
-        self._apply_form_to_current()
+    def _persist_state(self, *, show_error: bool = False, apply_form: bool = True) -> bool:
+        if apply_form:
+            self._apply_form_to_current()
         try:
             self.config_store.save(self.state)
             return True
@@ -572,6 +591,10 @@ class MainWindow(QMainWindow):
     def _on_config_edited(self, *_args: object) -> None:
         if self._loading_form:
             return
+        if self.sender() is self.name_edit:
+            item = self._find_project_item(self._current_project_id)
+            if item is not None:
+                item.setText(self.name_edit.text().strip() or "未命名项目")
         self._refresh_setup_status()
         self._refresh_action_state()
 

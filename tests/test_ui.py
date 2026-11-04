@@ -61,14 +61,81 @@ def test_project_switch_resolves_override_and_inherited_directories(qtbot, tmp_p
     assert window.full_button.isEnabled()
     assert window.adopt_button.isEnabled()
 
+    window.name_edit.setText("First renamed")
+    assert window.project_list.item(0).text() == "First renamed"
+
     window.project_list.setCurrentRow(1)
     qtbot.wait(20)
     assert window.name_edit.text() == "Second"
+    assert [window.project_list.item(row).text() for row in range(2)] == [
+        "First renamed",
+        "Second",
+    ]
     assert window.bundle_override_edit.text() == ""
     assert str(tmp_path / "global bundles") in window.bundle_effective_label.text()
     assert window.delta_button.isEnabled()
     assert window.push_button.isEnabled()
     assert not window.adopt_button.isEnabled()
+    window.close()
+
+
+def test_delete_project_keeps_remaining_project_configuration(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config" / "projects.json"
+    state = make_state(tmp_path)
+    window = MainWindow(
+        ConfigStore(config_path),
+        InMemoryCredentialStore(),
+        state,
+    )
+    qtbot.addWidget(window)
+    window.project_list.setCurrentRow(1)
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window._delete_project()
+
+    assert [project.id for project in window.state.projects] == ["first"]
+    remaining = window.state.projects[0]
+    assert remaining.name == "First"
+    assert remaining.github_url == "https://github.com/acme/first"
+    assert remaining.local_repo_path == str(tmp_path / "first")
+    assert remaining.ssh.host == "example.com"
+    assert window.name_edit.text() == "First"
+    assert window.project_list.item(0).text() == "First"
+
+    reloaded = ConfigStore(config_path).load()
+    assert [project.id for project in reloaded.projects] == ["first"]
+    assert reloaded.projects[0].github_url == "https://github.com/acme/first"
+    assert reloaded.projects[0].ssh.host == "example.com"
+    window.close()
+
+
+def test_new_project_name_avoids_existing_default_names(qtbot, tmp_path: Path) -> None:
+    state = make_state(tmp_path)
+    state.projects[0].name = "项目 1"
+    state.projects[1].name = "项目 3"
+    window = MainWindow(
+        ConfigStore(tmp_path / "config" / "projects.json"),
+        InMemoryCredentialStore(),
+        state,
+    )
+    qtbot.addWidget(window)
+
+    window._add_project()
+
+    assert window.state.projects[-1].name == "项目 4"
+    assert [window.project_list.item(row).text() for row in range(3)] == [
+        "项目 1",
+        "项目 3",
+        "项目 4",
+    ]
     window.close()
 
 
